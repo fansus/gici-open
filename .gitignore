@@ -58,3 +58,4 @@ data*/
 bin/
 lib/
 *.atx
+gici-dataset/
