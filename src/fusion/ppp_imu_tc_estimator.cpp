@@ -1,52 +1,79 @@
 /**
-* @Function: RTK/IMU tightly couple estimator
+* @Function: PPP/IMU tightly couple estimator
 *
 * @Author  : Cheng Chi
 * @Email   : chichengcn@sjtu.edu.cn
 *
 * Copyright (C) 2023 by Cheng Chi, All rights reserved.
 **/
-#include "gici/fusion/rtk_imu_tc_estimator.h"
+#include "gici/fusion/ppp_imu_tc_estimator.h"
 #include "gici/fusion/gnss_imu_initializer.h"
 
 namespace gici {
 
 // The default constructor
-RtkImuTcEstimator::RtkImuTcEstimator(
-               const RtkImuTcEstimatorOptions& options, 
+PppImuTcEstimator::PppImuTcEstimator(
+               const PppImuTcEstimatorOptions& options, 
                const GnssImuInitializerOptions& init_options, 
-               const RtkEstimatorOptions rtk_options, 
+               const PppEstimatorOptions ppp_options, 
                const GnssEstimatorBaseOptions& gnss_base_options, 
                const GnssLooseEstimatorBaseOptions& gnss_loose_base_options, 
                const ImuEstimatorBaseOptions& imu_base_options,
                const EstimatorBaseOptions& base_options,
                const AmbiguityResolutionOptions& ambiguity_options) :
-  tc_options_(options), rtk_options_(rtk_options),
+  tc_options_(options), ppp_options_(ppp_options),
   GnssEstimatorBase(gnss_base_options, base_options),
   ImuEstimatorBase(imu_base_options, base_options),
   EstimatorBase(base_options)
 {
-  type_ = EstimatorType::RtkImuTc;
+  type_ = EstimatorType::PppImuTc;
+  is_verbose_model_ = true;
+  is_ppp_ = true;
   is_use_phase_ = true;
   shiftMemory();
+
+  // SPP estimator for setting initial states
+  SppEstimatorOptions spp_options;
+  spp_options.use_dual_frequency = true;
+  spp_estimator_.reset(new SppEstimator(spp_options, gnss_base_options));
+
+  // Phase wind-up control
+  phase_windup_.reset(new PhaseWindup());
 
   // Ambiguity resolution
   ambiguity_resolution_.reset(new AmbiguityResolution(ambiguity_options, graph_));
 
   // Initialization control
-  initializer_sub_estimator_.reset(new RtkEstimator(
-    rtk_options, gnss_base_options, base_options, ambiguity_options));
+  initializer_sub_estimator_.reset(new PppEstimator(
+    ppp_options, gnss_base_options, base_options, ambiguity_options));
   initializer_.reset(new GnssImuInitializer(
     init_options, gnss_loose_base_options, imu_base_options, 
     base_options, graph_, initializer_sub_estimator_));
+
+  // Open intermediate data logging files
+  if (base_options_.log_intermediate_data) {
+    const std::string& directory = base_options_.log_intermediate_data_directory;
+    createAmbiguityLogger(directory);
+    createIonosphereLogger(directory);
+    createPseudorangeResidualLogger(directory);
+    createPhaserangeResidualLogger(directory);
+  }
 }
 
 // The default destructor
-RtkImuTcEstimator::~RtkImuTcEstimator()
-{}
+PppImuTcEstimator::~PppImuTcEstimator()
+{
+  // Close intermediate data logging files
+  if (base_options_.log_intermediate_data) {
+    freeAmbiguityLogger();
+    freeIonosphereLogger();
+    freePseudorangeResidualLogger();
+    freePhaserangeResidualLogger();
+  }
+}
 
 // Add measurement
-bool RtkImuTcEstimator::addMeasurement(const EstimatorDataCluster& measurement)
+bool PppImuTcEstimator::addMeasurement(const EstimatorDataCluster& measurement)
 {
   // Initialization
   if (coordinate_ == nullptr || !gravity_setted_) return false;
@@ -70,72 +97,86 @@ bool RtkImuTcEstimator::addMeasurement(const EstimatorDataCluster& measurement)
   }
 
   // Add GNSS
-  if (measurement.gnss) {
-    GnssMeasurement rov, ref;
-    meausrement_align_.add(measurement);
-    if (meausrement_align_.get(rtk_options_.max_age, rov, ref)) {
-      return addGnssMeasurementAndState(rov, ref);
-    }
+  if (measurement.gnss && measurement.gnss_role == GnssRole::Rover) {
+    return addGnssMeasurementAndState(*measurement.gnss);
   }
 
   return false;
 }
 
 // Add GNSS measurements and state
-bool RtkImuTcEstimator::addGnssMeasurementAndState(
-    const GnssMeasurement& measurement_rov, 
-    const GnssMeasurement& measurement_ref)
+bool PppImuTcEstimator::addGnssMeasurementAndState(
+    const GnssMeasurement& measurement)
 {
   // Get prior states
-  Eigen::Vector3d position_prior = coordinate_->convert(
-    getPoseEstimate().getPosition(), GeoType::ENU, GeoType::ECEF);
+  if (!spp_estimator_->addGnssMeasurementAndState(measurement)) {
+    return false;
+  }
+  if (!spp_estimator_->estimate()) {
+    return false;
+  }
+  Eigen::Vector3d position_prior = spp_estimator_->getPositionEstimate();
+  Eigen::Vector3d velocity_prior = spp_estimator_->getVelocityEstimate();
+  std::map<char, double> clock_prior = spp_estimator_->getClockEstimate();
+  std::map<char, double> frequency_prior = spp_estimator_->getFrequencyEstimate();
 
   // Set to local measurement handle
-  curGnssRov() = measurement_rov;
-  curGnssRov().position = position_prior;
-  curGnssRef() = measurement_ref;
+  curGnss() = measurement;
+  curGnss().position = position_prior;
+  curGnss().phase_windup = phase_windup_;
 
   // Erase duplicated phases, arrange to one observation per phase
-  gnss_common::rearrangePhasesAndCodes(curGnssRov());
-  gnss_common::rearrangePhasesAndCodes(curGnssRef());
+  gnss_common::rearrangePhasesAndCodes(curGnss(), true);
 
-  // Form double difference pair
-  std::map<char, std::string> system_to_base_prn;
-  GnssMeasurementDDIndexPairs phase_index_pairs = gnss_common::formPhaserangeDDPair(
-    curGnssRov(), curGnssRef(), system_to_base_prn, gnss_base_options_.common);
-  GnssMeasurementDDIndexPairs code_index_pairs = gnss_common::formPseudorangeDDPair(
-    curGnssRov(), curGnssRef(), system_to_base_prn, gnss_base_options_.common);
+  // Correct code bias
+  correctCodeBias(curGnss(), false);
+
+  // Correct phase bias
+  if (curGnss().phase_bias->valid()) correctPhaseBias(curGnss());
+
+  // Correct BDS satellite multipath
+  correctBdsSatelliteMultipath(curGnss());
+
+  // Compute ionosphere delays
+  computeIonosphereDelay(curGnss());
 
   // Cycle-slip detection
   if (!isFirstEpoch()) {
-    cycleSlipDetectionSD(lastGnssRov(), lastGnssRef(), 
-      curGnssRov(), curGnssRef(), gnss_base_options_.common);
+    cycleSlipDetection(lastGnss(), curGnss(), gnss_base_options_.common);
   }
 
   // Add parameter blocks
-  double timestamp = curGnssRov().timestamp;
+  double timestamp = curGnss().timestamp;
   // pose and speed and bias block
-  const int32_t bundle_id = curGnssRov().id;
+  const int32_t bundle_id = curGnss().id;
   BackendId pose_id = createGnssPoseId(bundle_id);
   size_t index = insertImuState(timestamp, pose_id);
   CHECK(index == states_.size() - 1);
   curState().status = GnssSolutionStatus::Single;
   // GNSS extrinsics, it should be added at initialization step
   CHECK(gnss_extrinsics_id_.valid());
+  // clock block
+  int num_valid_system = 0;
+  addClockParameterBlocks(curGnss(), curGnss().id, num_valid_system, clock_prior);
+  // troposphere block
+  addTroposphereParameterBlock(curGnss().id);
+  // ionosphere blocks
+  addIonosphereParameterBlocks(curGnss(), curGnss().id, curIonosphereState());
   // ambiguity blocks
-  addSdAmbiguityParameterBlocks(curGnssRov(), 
-    curGnssRef(), phase_index_pairs, curGnssRov().id, curAmbiguityState());
+  addAmbiguityParameterBlocks(curGnss(), curGnss().id, curAmbiguityState());
+  // inter-frequency bias (IFB) blocks
+  addIfbParameterBlocks(curGnss(), curGnss().id);
   // frequency block
   int num_valid_doppler_system = 0;
-  addFrequencyParameterBlocks(curGnssRov(), curGnssRov().id, num_valid_doppler_system);
+  addFrequencyParameterBlocks(curGnss(), curGnss().id, 
+    num_valid_doppler_system, frequency_prior);
 
   // Add pseudorange residual blocks
   int num_valid_satellite = 0;
-  addDdPseudorangeResidualBlocks(curGnssRov(), 
-    curGnssRef(), code_index_pairs, curState(), num_valid_satellite);
+  addPseudorangeResidualBlocks(curGnss(), curState(), num_valid_satellite);
   
   // We do not need to check if the number of satellites is sufficient in tightly fusion.
-  if (!checkSufficientSatellite(num_valid_satellite, 0)) {
+  if (!checkSufficientSatellite(num_valid_satellite, num_valid_system)) {
     // do nothing
   }
   num_satellites_ = num_valid_satellite;
@@ -143,27 +184,44 @@ bool RtkImuTcEstimator::addGnssMeasurementAndState(
   // No satellite
   if (num_satellites_ == 0) {
     // erase parameters in current state
-    eraseFrequencyParameterBlocks(curState());
     eraseImuState(curState());
+    eraseClockParameterBlocks(curState());
+    eraseTroposphereParameterBlock(curState());
+    eraseIonosphereParameterBlocks(curIonosphereState());
     eraseAmbiguityParameterBlocks(curAmbiguityState());
+    eraseFrequencyParameterBlocks(curState());
+
     return false;
   }
 
   // Add phaserange residual blocks
-  addDdPhaserangeResidualBlocks(
-    curGnssRov(), curGnssRef(), phase_index_pairs, curState());
+  addPhaserangeResidualBlocks(curGnss(), curState());
 
   // Add doppler residual blocks
-  addDopplerResidualBlocks(curGnssRov(), curState(), num_valid_satellite, 
-    false, getImuMeasurementNear(timestamp).angular_velocity);
+  addDopplerResidualBlocks(curGnss(), curState(), num_valid_satellite);
+
+  // Add position and velocity prior constraints
+  if (isFirstEpoch()) {
+    addGnssPositionResidualBlock(curState(), 
+      position_prior, gnss_base_options_.error_parameter.initial_position);
+    addGnssVelocityResidualBlock(curState(), 
+      velocity_prior, gnss_base_options_.error_parameter.initial_velocity);
+  }
 
   // Add relative errors
   if (!isFirstEpoch()) {
     // frequency
     addRelativeFrequencyResidualBlock(lastState(), curState());
+    // isb
+    // addRelativeIsbResidualBlock(lastState(), curState());
+    // troposphere
+    addRelativeTroposphereResidualBlock(lastState(), curState());
+    // ionosphere
+    addRelativeIonosphereResidualBlock(
+      lastIonosphereState(), curIonosphereState());
     // ambiguity
     addRelativeAmbiguityResidualBlock(
-      lastGnssRov(), curGnssRov(), lastAmbiguityState(), curAmbiguityState());
+      lastGnss(), curGnss(), lastAmbiguityState(), curAmbiguityState());
   }
 
   // ZUPT
@@ -177,14 +235,11 @@ bool RtkImuTcEstimator::addGnssMeasurementAndState(
     addNHCResidualBlock(curState());
   }
 
-  // Compute DOP
-  updateGdop(curGnssRov(), code_index_pairs);
-
   return true;
 }
 
 // Solve current graph
-bool RtkImuTcEstimator::estimate()
+bool PppImuTcEstimator::estimate()
 {
   // Optimize with FDE
   size_t n_pseudorange = numPseudorangeError(curState());
@@ -231,7 +286,7 @@ bool RtkImuTcEstimator::estimate()
 
   // Ambiguity resolution
   curState().status = GnssSolutionStatus::Float;
-  if (rtk_options_.use_ambiguity_resolution) {
+  if (ppp_options_.use_ambiguity_resolution) {
     // get covariance of ambiguities
     Eigen::MatrixXd ambiguity_covariance;
     std::vector<uint64_t> parameter_block_ids;
@@ -240,16 +295,15 @@ bool RtkImuTcEstimator::estimate()
     }
     graph_->computeCovariance(parameter_block_ids, ambiguity_covariance);
     // solve
-    AmbiguityResolution::Result ret = ambiguity_resolution_->solveRtk(
-      curState().id, curAmbiguityState().ids, 
-      ambiguity_covariance, gnss_measurement_pairs_.back());
+    AmbiguityResolution::Result ret = ambiguity_resolution_->solvePpp(
+      curState().id, curAmbiguityState().ids, ambiguity_covariance, curGnss());
     if (ret == AmbiguityResolution::Result::NlFix) {
       curState().status = GnssSolutionStatus::Fixed;
     }
   }
 
   // Check if we continuously cannot fix ambiguity, while we have good observations
-  if (rtk_options_.use_ambiguity_resolution) {
+  if (ppp_options_.use_ambiguity_resolution) {
     const double thr = gnss_base_options_.good_observation_max_reject_ratio;
     if (isGnssGoodObservation() && ratio_pseudorange < thr && 
         ratio_phaserange < thr && ratio_doppler < thr) {
@@ -286,7 +340,7 @@ bool RtkImuTcEstimator::estimate()
 }
 
 // Set initializatin result
-void RtkImuTcEstimator::setInitializationResult(
+void PppImuTcEstimator::setInitializationResult(
   const std::shared_ptr<MultisensorInitializerBase>& initializer)
 {
   CHECK(initializer->finished());
@@ -308,8 +362,9 @@ void RtkImuTcEstimator::setInitializationResult(
     imu_measurements_.push_front(*it);
     imu_mutex_.unlock();
   }
-  gnss_measurement_pairs_.resize(gnss_solution_measurements.size());
+  gnss_measurements_.resize(gnss_solution_measurements.size());
   ambiguity_states_.resize(states_.size());
+  ionosphere_states_.resize(states_.size());
 
   // Shift memory for states and measurements
   shiftMemory();
@@ -319,7 +374,7 @@ void RtkImuTcEstimator::setInitializationResult(
 }
 
 // Marginalization
-bool RtkImuTcEstimator::marginalization()
+bool PppImuTcEstimator::marginalization()
 {
   // Check if we need marginalization
   if (states_.size() < tc_options_.max_window_length) {
@@ -332,6 +387,12 @@ bool RtkImuTcEstimator::marginalization()
   // Add marginalization items
   // IMU states and residuals
   addImuStateMarginBlockWithResiduals(oldestState());
+  // clock
+  addClockMarginBlocksWithResiduals(oldestState());
+  // troposphere
+  addTroposphereMarginBlockWithResiduals(oldestState());
+  // ionosphere
+  addIonosphereMarginBlocksWithResiduals(oldestIonosphereState());
   // ambiguity
   addAmbiguityMarginBlocksWithResiduals(oldestAmbiguityState());
   // frequency

@@ -31,7 +31,9 @@ PppEstimator::PppEstimator(const PppEstimatorOptions& options,
   shiftMemory();
 
   // SPP estimator for setting initial states
-  spp_estimator_.reset(new SppEstimator(gnss_base_options));
+  SppEstimatorOptions spp_options;
+  spp_options.use_dual_frequency = true;
+  spp_estimator_.reset(new SppEstimator(spp_options, gnss_base_options));
 
   // Phase wind-up control
   phase_windup_.reset(new PhaseWindup());
@@ -94,7 +96,7 @@ bool PppEstimator::addGnssMeasurementAndState(
   curGnss().phase_windup = phase_windup_;
 
   // Erase duplicated phases, arrange to one observation per phase
-  gnss_common::rearrangePhasesAndCodes(curGnss(), false);
+  gnss_common::rearrangePhasesAndCodes(curGnss(), true);
 
   // Correct code bias
   correctCodeBias(curGnss(), false);
@@ -139,7 +141,7 @@ bool PppEstimator::addGnssMeasurementAndState(
     addFrequencyParameterBlocks(curGnss(), curGnss().id, 
       num_valid_doppler_system, frequency_prior);
   }
-  
+
   // Add pseudorange residual blocks
   int num_valid_satellite = 0;
   addPseudorangeResidualBlocks(curGnss(), curState(), num_valid_satellite);
@@ -169,6 +171,16 @@ bool PppEstimator::addGnssMeasurementAndState(
     addDopplerResidualBlocks(curGnss(), curState(), num_valid_satellite);
   }
 
+  // Add position and velocity prior constraints
+  if (isFirstEpoch()) {
+    addGnssPositionResidualBlock(curState(), 
+      position_prior, gnss_base_options_.error_parameter.initial_position);
+    if (ppp_options_.estimate_velocity) {
+      addGnssVelocityResidualBlock(curState(), 
+        velocity_prior, gnss_base_options_.error_parameter.initial_velocity);
+    }
+  }
+
   // Add relative errors
   if (!isFirstEpoch()) {
     if (!ppp_options_.estimate_velocity) {
@@ -177,10 +189,12 @@ bool PppEstimator::addGnssMeasurementAndState(
     }
     else {
       // position and velocity
-      addRelativePositionAndVelocityBlock(lastState(), curState());
+      addRelativePositionAndVelocityResidualBlock(lastState(), curState());
       // frequency
-      addRelativeFrequencyBlock(lastState(), curState());
+      addRelativeFrequencyResidualBlock(lastState(), curState());
     }
+    // isb
+    // addRelativeIsbResidualBlock(lastState(), curState());
     // troposphere
     addRelativeTroposphereResidualBlock(lastState(), curState());
     // ionosphere

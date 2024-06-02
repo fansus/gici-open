@@ -1,5 +1,5 @@
 /**
-* @Function: Non-holonomic constraint error
+* @Function: Relative Inter-System Bias (ISB) error
 *
 * @Author  : Cheng Chi
 * @Email   : chichengcn@sjtu.edu.cn
@@ -13,71 +13,53 @@
 // Eigen 3.2.7 uses std::binder1st and std::binder2nd which are deprecated since c++11
 // Fix is in 3.3 devel (http://eigen.tuxfamily.org/bz/show_bug.cgi?id=872).
 #include <ceres/ceres.h>
+#include <Eigen/Core>
 #pragma diagnostic pop
 
 #include "gici/estimate/error_interface.h"
 
 namespace gici {
 
-/// \brief Non-holonomic constraint error.
-class NHCError :
-    public ceres::SizedCostFunction<2 /* number of residuals */,
-                                    7 /* size of first parameter */,
-                                    9 /* size of second parameter */>,
+// Relative ISB error between two systems
+class RelativeIsbError :
+    public ceres::SizedCostFunction<
+    1 /* number of residuals */,
+    1, 1, 1, 1 /* parameter blocks */>,
     public ErrorInterface
 {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
   /// \brief The base class type.
-  typedef ceres::SizedCostFunction<2, 7, 9> base_t;
+  typedef ceres::SizedCostFunction<1, 1, 1, 1, 1> base_t;
 
-  /// \brief The number of residuals (1).
-  static const int kNumResiduals = 2;
+  /// \brief Number of residuals (1).
+  static const int kNumResiduals = 1;
 
-  /// \brief The information matrix type (6x6).
-  typedef Eigen::Matrix<double, 2, 2> information_t;
+  /// \brief The information matrix type (1x1).
+  typedef Eigen::Matrix<double, 1, 1> information_t;
 
   /// \brief The covariance matrix type (same as information).
-  typedef Eigen::Matrix<double, 2, 2> covariance_t;
+  typedef Eigen::Matrix<double, 1, 1> covariance_t;
 
   /// \brief Default constructor.
-  NHCError() = default;
+  RelativeIsbError();
 
-  /// \brief Construct with STD.
-  /// @param[in] std STD of non-holonomic constraint.
-  NHCError(const double std);
+  /// \brief Construct with measurement and information matrix
+  /// The sequency should be consistant with template parameter blocks
+  RelativeIsbError(const double information);
 
   /// \brief Trivial destructor.
-  virtual ~NHCError() = default;
+  virtual ~RelativeIsbError() {}
 
-  /// \name Setters
-  /// \{
-
-  /// \brief Set the measurement.
-  /// @param[in] measurement The measurement.
-  void setMeasurement(const double& measurement)
+  // Set information
+  void setInformation(const information_t information)
   {
-    measurement_ = measurement;
+    information_ = information;  
+    Eigen::LLT<information_t> lltOfInformation(information_); 
+    square_root_information_ = lltOfInformation.matrixL().transpose();  
+    square_root_information_inverse_ = square_root_information_.inverse(); 
   }
-
-  /// \}
-  /// \name Getters
-  /// \{
-
-  /// \brief Get the measurement.
-  /// \return The measurement vector.
-  const double& measurement() const { return measurement_; }
-
-  /// \brief Get the information matrix.
-  /// \return The information (weight) matrix.
-  const information_t& information() const { return information_; }
-
-  /// \brief Get the covariance matrix.
-  /// \return The inverse information (covariance) matrix.
-  const information_t& covariance() const { return covariance_; }
-
-  /// \}
 
   // error term and Jacobian implementation
   /**
@@ -99,10 +81,9 @@ public:
    * @param jacobians_minimal Pointer to the minimal Jacobians (equivalent to jacobians).
    * @return Success of the evaluation.
    */
-  virtual bool EvaluateWithMinimalJacobians(double const* const * parameters,
-                                            double* residuals,
-                                            double** jacobians,
-                                            double** jacobians_minimal) const;
+  bool EvaluateWithMinimalJacobians(double const* const * parameters,
+                                    double* residuals, double** jacobians,
+                                    double** jacobians_minimal) const;
 
   // sizes
   /// \brief Residual dimension.
@@ -120,30 +101,24 @@ public:
     return base_t::parameter_block_sizes().at(parameter_block_idx);
   }
 
-  /// @brief Return parameter block type as string
+  /// @brief Residual block type as string
   virtual ErrorType typeInfo() const
   {
-    return ErrorType::kNHCError;
+    return ErrorType::kRelativeIsbError;
   }
 
   // Convert normalized residual to raw residual
   virtual void deNormalizeResidual(double *residuals) const
   {
-    Eigen::Map<Eigen::Matrix<double, 2, 1>> Residual(residuals);
+    Eigen::Map<Eigen::Matrix<double, 1, 1>> Residual(residuals);
     Residual = square_root_information_inverse_ * Residual;
   }
 
 protected:
-  // the measurement
-  double measurement_; ///< The yaw measurement.
-  
-  // weighting related
-  double attitude_std_;
-  mutable information_t information_; ///< The DimxDim information matrix.
-  mutable information_t square_root_information_; ///< The DimxDim square root information matrix.
-  mutable information_t square_root_information_inverse_;
-  mutable covariance_t covariance_; ///< The DimxDim covariance matrix.
-
+  information_t information_;
+  information_t square_root_information_; ///< The DimxDim square root information matrix.
+  information_t square_root_information_inverse_;
 };
 
-}  // namespace gici
+}  
+

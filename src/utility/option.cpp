@@ -30,6 +30,7 @@
 #include "gici/fusion/gnss_imu_initializer.h"
 #include "gici/fusion/spp_imu_tc_estimator.h"
 #include "gici/fusion/rtk_imu_tc_estimator.h"
+#include "gici/fusion/ppp_imu_tc_estimator.h"
 #include "gici/fusion/gnss_imu_camera_srr_estimator.h"
 #include "gici/fusion/spp_imu_camera_rrr_estimator.h"
 #include "gici/fusion/rtk_imu_camera_rrr_estimator.h"
@@ -152,6 +153,7 @@ void convert<std::string, EstimatorType>
   MAP_IN_OUT("spp_imu_tc", EstimatorType::SppImuTc);
   MAP_IN_OUT("dgnss_imu_tc", EstimatorType::DgnssImuTc);
   MAP_IN_OUT("rtk_imu_tc", EstimatorType::RtkImuTc);
+  MAP_IN_OUT("ppp_imu_tc", EstimatorType::PppImuTc);
   MAP_IN_OUT("gnss_imu_camera_srr", EstimatorType::GnssImuCameraSrr);
   MAP_IN_OUT("spp_imu_camera_rrr", EstimatorType::SppImuCameraRrr);
   MAP_IN_OUT("dgnss_imu_camera_rrr", EstimatorType::DgnssImuCameraRrr);
@@ -337,6 +339,7 @@ void loadOptions<GnssCommonOptions>(
     YAML::Node& node, GnssCommonOptions& options)
 {
   LOAD_COMMON(min_elevation);
+  LOAD_COMMON(min_num_satellite_redundancy);
   LOAD_COMMON(max_gdop);
   LOAD_COMMON(mw_slip_thres);
   LOAD_COMMON(gf_slip_thres);
@@ -409,6 +412,9 @@ void loadOptions<GnssErrorParameter>(
   LOAD_COMMON(troposphere_augment);
   LOAD_COMMON(ephemeris_broadcast);
   LOAD_COMMON(ephemeris_precise);
+  LOAD_COMMON(initial_position);
+  LOAD_COMMON(initial_velocity);
+  LOAD_COMMON(initial_clock);
   LOAD_COMMON(initial_troposphere);
   LOAD_COMMON(initial_ionosphere);
   LOAD_COMMON(initial_ambiguity);
@@ -584,6 +590,8 @@ void loadOptions<FeatureHandlerOptions>(
   LOAD_COMMON(kfselect_min_dt);
   LOAD_COMMON(max_pyramid_level);
   LOAD_COMMON(min_disparity_init_landmark);
+  LOAD_COMMON(min_translation_init_landmark);
+  LOAD_COMMON(min_parallax_angle_init_landmark);
 
   if (checkSubOption(node, "detector")) {
     YAML::Node subnode = node["detector"];
@@ -685,7 +693,10 @@ template <>
 void loadOptions<GnssLooseEstimatorBaseOptions>(
     YAML::Node& node, GnssLooseEstimatorBaseOptions& options)
 {
-
+  LOAD_COMMON(use_outlier_rejection);
+  LOAD_COMMON(max_position_error);
+  LOAD_COMMON(max_velocity_error);
+  LOAD_COMMON(diverge_min_num_continuous_reject);
 }
 
 template <>
@@ -694,6 +705,12 @@ void loadOptions<ImuEstimatorBaseOptions>(
 {
   LOAD_COMMON(car_motion);
   LOAD_COMMON(body_to_imu_rotation_std);
+  LOAD_COMMON(use_zupt);
+  LOAD_COMMON(zupt_duration);
+  LOAD_COMMON(zupt_max_acc_std);
+  LOAD_COMMON(zupt_max_gyro_std);
+  LOAD_COMMON(zupt_max_gyro_median);
+  LOAD_COMMON(zupt_sigma_zero_velocity);
   LOAD_COMMON(car_motion_min_velocity);
   LOAD_COMMON(car_motion_max_anguler_velocity);
 
@@ -720,6 +737,7 @@ void loadOptions<SppEstimatorOptions>(
     YAML::Node& node, SppEstimatorOptions& options)
 {
   LOAD_COMMON(estimate_velocity);
+  LOAD_COMMON(use_dual_frequency);
 }
 
 template <>
@@ -774,6 +792,13 @@ void loadOptions<SppImuTcEstimatorOptions>(
 template <>
 void loadOptions<RtkImuTcEstimatorOptions>(
     YAML::Node& node, RtkImuTcEstimatorOptions& options)
+{
+  LOAD_COMMON(max_window_length);
+}
+
+template <>
+void loadOptions<PppImuTcEstimatorOptions>(
+    YAML::Node& node, PppImuTcEstimatorOptions& options)
 {
   LOAD_COMMON(max_window_length);
 }
@@ -852,6 +877,18 @@ void loadOptions<VisualEstimatorBaseOptions>(
   LOAD_COMMON(max_frequency);
   LOAD_COMMON(diverge_max_reject_ratio);
   LOAD_COMMON(diverge_min_num_continuous_reject);
+
+  std::vector<double> camera_extrinsics_initial_std;
+  if (option_tools::safeGet(node, "camera_extrinsics_initial_std", 
+      &camera_extrinsics_initial_std) && 
+      camera_extrinsics_initial_std.size() == 6) {
+    for (size_t i = 0; i < 6; i++) {
+      options.camera_extrinsics_initial_std[i] = camera_extrinsics_initial_std[i];
+    }
+  }
+  else {
+    LOG(INFO) << "Unable to load camera_extrinsics_initial_std. Using default instead.";
+  } 
 }
 
 // Copy the options with the same name from in to out

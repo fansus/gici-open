@@ -114,10 +114,12 @@ bool SppImuCameraRrrEstimator::addGnssMeasurementAndState(
   CHECK(gnss_extrinsics_id_.valid());
   // clock block
   int num_valid_system = 0;
-  addClockParameterBlocks(curGnss(), curGnss().id, num_valid_system);
+  addClockParameterBlocks(curGnss(), curGnss().id, num_valid_system, 
+    std::map<char, double>(), true);
   // frequency block
   int num_valid_doppler_system = 0;
-  addFrequencyParameterBlocks(curGnss(), curGnss().id, num_valid_doppler_system);
+  addFrequencyParameterBlocks(curGnss(), curGnss().id, num_valid_doppler_system, 
+    std::map<char, double>(), true);
 
   // Add pseudorange residual blocks
   int num_valid_satellite = 0;
@@ -145,8 +147,11 @@ bool SppImuCameraRrrEstimator::addGnssMeasurementAndState(
   // Add relative errors
   if (lastGnssState().valid()) {  // maybe invalid here because of long term GNSS absent
     // frequency
-    addRelativeFrequencyBlock(lastGnssState(), states_[index]);
+    addRelativeFrequencyResidualBlock(lastGnssState(), states_[index]);
   }
+
+  // ZUPT
+  addZUPTResidualBlock(curState());
 
   // Car motion
   if (imu_base_options_.car_motion) {
@@ -199,6 +204,9 @@ bool SppImuCameraRrrEstimator::addImageMeasurementAndState(
   if (!camera_extrinsics_id_.valid()) {
     camera_extrinsics_id_ = 
       addCameraExtrinsicsParameterBlock(bundle_id, curFrame()->T_imu_cam());
+    addCameraExtrinsicsResidualBlock(camera_extrinsics_id_, curFrame()->T_imu_cam(), 
+      visual_base_options_.camera_extrinsics_initial_std.head<3>(), 
+      visual_base_options_.camera_extrinsics_initial_std.tail<3>() * D2R);
   }
 
   // Initialize landmarks
